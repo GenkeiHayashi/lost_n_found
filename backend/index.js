@@ -1,11 +1,9 @@
 import express from "express";
-import users from "./user.js"; // Mock user data (for /api/user test)
 import cors from "cors";
 import * as dotenv from 'dotenv';
 import admin from 'firebase-admin'; // Firebase Admin SDK
 import path from 'path'; // Node.js native module for path resolution
 import { fileURLToPath } from 'url'; // For path resolution in ES Modules
-import { mockLostItemData, mockQueryResults } from './mock-data.js';
 import { Storage } from '@google-cloud/storage'; // Google Cloud Storage SDK
 import multer from 'multer'; // Middleware for handling file uploads
 
@@ -29,7 +27,7 @@ if (!serviceAccountPath || !projectId) {
 
 // Resolve the absolute path to the JSON key file
 const absolutePath = path.resolve(__dirname, serviceAccountPath); 
-
+console.log(`DEBUG PATH: Resolved Service Account Key Path: ${absolutePath}`);
 try {
     // Initialize Firebase Admin SDK
     admin.initializeApp({
@@ -56,7 +54,7 @@ const storage = new Storage({
 });
 
 // Define the bucket name (usually projectId.appspot.com)
-const bucketName = `${projectId}.appspot.com`;
+const bucketName = `${projectId}.firebasestorage.app`;
 const bucket = storage.bucket(bucketName);
 
 
@@ -83,8 +81,8 @@ app.use(cors());         // Essential for frontend communication
 // --- AUTHENTICATION PLACEHOLDER MIDDLEWARE ---
 
 const verifyTokenPlaceholder = (req, res, next) => {
-    // TEMPORARY: In a real app, this verifies the token and extracts the UID.
-    req.user = { uid: 'TEST_USER_POSTER_UID_12345' }; 
+    // Replace 'PASTE_YOUR_SAVED_UID_HERE' with the UID you got from Step 1.
+    req.user = { uid: 'zoWc2u0MWphZdmf38nSfWTkqa8v1' }; 
     next();
 };
 
@@ -216,14 +214,50 @@ app.post('/api/items', verifyTokenPlaceholder, upload.single('itemImage'), async
 });
 
 
-// 2. READ ALL ITEMS ROUTE (GET /api/items)
-app.get('/api/items/:id', verifyTokenPlaceholder, async (req, res) => {
+// 2. READ & FILTER ITEMS ROUTE (GET /api/items)
+app.get('/api/items', verifyTokenPlaceholder, async (req, res) => {
+    
+    // Extract query parameters from req.query
+    const { category, status, lastSeenLocation, sortBy, sortOrder } = req.query; 
+
     try {
-        // Query Firestore for all approved and unresolved items
-        const snapshot = await db.collection('items')
+        let itemsRef = db.collection('items');
+        
+        // 1. BASE QUERY: Filter for approved and unresolved items (Required for public view)
+        let query = itemsRef
             .where('isApproved', '==', true)
-            .where('isResolved', '==', false)
-            .get();
+            .where('isResolved', '==', false);
+
+        // 2. DYNAMIC FILTERING (Exact Match)
+        if (category) {
+            // Filter by item type/category
+            query = query.where('category', '==', category);
+        }
+        
+        if (status && (status === 'lost' || status === 'found')) {
+            // Filter by item status
+            query = query.where('status', '==', status);
+        }
+        
+        if (lastSeenLocation) {
+             // Filter by location
+             // NOTE: This performs an exact match on the 'lastSeenLocation' field
+             query = query.where('lastSeenLocation', '==', lastSeenLocation);
+        }
+        
+        // 3. SORTING (Includes date filtering)
+        // Default sort field is 'dateReported' (Newest first)
+        const sortField = sortBy || 'dateReported';
+        // Order must be 'asc' or 'desc'. Default descending.
+        const order = sortOrder === 'asc' ? 'asc' : 'desc'; 
+        
+        // IMPORTANT: Firestore requires an orderBy() on any field used in a range or inequality filter.
+        // For basic exact matching (==), you can sort on any field.
+        query = query.orderBy(sortField, order);
+
+
+        // 4. Execute the Query
+        const snapshot = await query.get();
 
         const items = snapshot.docs.map(doc => ({
             id: doc.id,
@@ -238,25 +272,9 @@ app.get('/api/items/:id', verifyTokenPlaceholder, async (req, res) => {
 });
 
 
-// 3. TEMPORARY GET MOCK DATA ROUTE (Simulates DB read for frontend development)
-app.get('/api/items/mock', verifyTokenPlaceholder, (req, res) => {
-    console.log("--- Sending Mock Item Array for Frontend Testing ---");
-    // Sends the structured data wrapped in an array, just like a DB query result
-    res.json(mockQueryResults); 
-});
+// 3. USER & ADMIN MANAGEMENT ENDPOINTS
 
-
-// 4. TEMPORARY POST TEST ROUTE (Uses hardcoded data from mock-data.js, no file upload test)
-app.post('/api/test-item', verifyTokenPlaceholder, async (req, res) => {
-    console.log("--- Running POST Test to Firestore (No File Upload) ---");
-    // Calls the shared creation logic with the imported mock data (which has imageTempRef)
-    await createItemPost(req, res, mockLostItemData, null);
-});
-
-
-// 5. USER & ADMIN MANAGEMENT ENDPOINTS
-
-// Route 5a: Register New User
+// Route 3a: Register New User
 app.post('/api/auth/register', async (req, res) => {
     // In a real app, you would validate email/password here.
     const { email, password, displayName } = req.body;
@@ -291,7 +309,7 @@ app.post('/api/auth/register', async (req, res) => {
 });
 
 
-// Route 5b: Set Admin Role (Admin Utility - needs protection later)
+// Route 3b: Set Admin Role (Admin Utility - needs protection later)
 app.post('/api/admin/set-role', verifyTokenPlaceholder, async (req, res) => {
     const { targetUid, role } = req.body; // targetUid: UID to promote, role: 'admin' or 'user'
 

@@ -1,4 +1,2 @@
-##
-
-GET http://localhost:3000/api/items/pMs2Ea7VIPEFBPNLvkoJ
-Content-Type: application/json
+### Step 5: GET All Approved Items
+GET http://localhost:3000/api/items
