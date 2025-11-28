@@ -5,22 +5,22 @@ Content-Type: multipart/form-data; boundary=Rest_Client_Boundary
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="name"
 
-My Matric Card
+Laptop Bag
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="description"
 
-Lost my matric card near the lake
+Black Hp laptop bag with green stripes, got few keychains, chiikawa + pink pig, and french fries keychains
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="category"
 
-Matric Card
+Personal Items
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="status"
 
-lost
+found
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="itemImage"; filename="test_image.jpg"
 Content-Type: image/jpeg
 
-< C:\Users\User\Downloads\test_image.jpg
+< C:\Users\User\Downloads\20251129_033148.jpg
 --Rest_Client_Boundary--

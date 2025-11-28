@@ -6,6 +6,9 @@ import path from 'path'; // Node.js native module for path resolution
 import { fileURLToPath } from 'url'; // For path resolution in ES Modules
 import { Storage } from '@google-cloud/storage'; // Google Cloud Storage SDK
 import multer from 'multer'; // Middleware for handling file uploads
+import { GoogleGenAI } from "@google/genai"; // Gemini SDK
+import { GoogleAuth } from 'google-auth-library'; // NEW IMPORT
+import axios from 'axios';
 
 // Load environment variables immediately
 dotenv.config();
@@ -63,7 +66,7 @@ const bucket = storage.bucket(bucketName);
 const upload = multer({
     storage: multer.memoryStorage(),
     limits: {
-        fileSize: 5 * 1024 * 1024, // Limit files to 5MB (Good practice for performance/cost)
+        fileSize: 10 * 1024 * 1024, // Limit files to 5MB (Good practice for performance/cost)
     },
 });
 
@@ -86,24 +89,26 @@ const verifyTokenPlaceholder = (req, res, next) => {
     next();
 };
 
+const authClient = new GoogleAuth({ 
+    keyFile: absolutePath, // <--- 1. Tells it WHICH file to use
+    scopes: ['https://www.googleapis.com/auth/cloud-platform'], // <--- 2. Tells it WHAT permissions to ask for
+});
 
 // --- STORAGE UTILITY FUNCTION ---
 
 /**
- * Uploads a file buffer (from Multer) to Firebase Storage.
+ * Uploads a file buffer (from Multer) to Firebase Storage and returns a Signed URL.
+ * The Signed URL grants time-limited read access to the AI model.
  * @param {object} file - The file object provided by Multer.
- * @returns {string} The public URL of the uploaded file.
+ * @returns {string} The Signed URL of the uploaded file.
  */
 const uploadFileToStorage = async (file) => {
     if (!file) return null;
 
-    // Create a unique file name using the current timestamp and original name
     const timestamp = Date.now();
     const fileName = `items/${timestamp}_${file.originalname.replace(/ /g, '_')}`;
-
     const fileUpload = bucket.file(fileName);
 
-    // Create a writable stream and pipeline the file buffer to it
     const stream = fileUpload.createWriteStream({
         metadata: {
             contentType: file.mimetype,
@@ -117,19 +122,135 @@ const uploadFileToStorage = async (file) => {
         });
 
         stream.on('finish', async () => {
-            // Make the file publicly readable
-            // NOTE: In a production app, you might use signed URLs instead of making it public.
-            await fileUpload.makePublic(); 
-            // Return the public URL
-            const publicUrl = `https://storage.googleapis.com/${bucketName}/${fileName}`;
-            resolve(publicUrl);
+            // 🛑 IMPORTANT: Do NOT make public. Use Signed URL instead.
+            // await fileUpload.makePublic(); // Comment out or remove this line!
+
+            // Generate a Signed URL valid for 30 minutes (1800 seconds)
+            const [signedUrl] = await fileUpload.getSignedUrl({
+                action: 'read',
+                expires: Date.now() + 1800 * 1000, // Expires in 30 minutes
+            });
+            
+            // Return the Signed URL
+            resolve(signedUrl);
         });
         
-        // End the stream with the file buffer
         stream.end(file.buffer); 
     });
 };
 
+// --- AI UTILITY FUNCTION (GEMINI EMBEDDING) ---
+// Ensure you have GEMINI_API_KEY in your .env file
+const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
+
+if (!GEMINI_API_KEY) {
+    console.error("❌ FATAL: GEMINI_API_KEY is missing in .env file.");
+    process.exit(1);
+}
+
+// Initialize the Gemini Client
+const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
+const EMBEDDING_MODEL = 'models/gemini-2.5-flash'; // Flash supports multimodal content
+// NOTE: For pure text embedding, 'text-embedding-004' is often used, but we use a multimodal model to handle the image part.
+// Vertex AI Setup for Text Embedding (Requires Service Account Auth)
+const LOCATION = 'asia-southeast1'; // Use a consistent region
+// Model for reliable text embedding
+const EMBEDDING_MODEL_ID = 'text-embedding-004'; 
+const VERTEX_ENDPOINT = `https://${LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${LOCATION}/publishers/google/models/${EMBEDDING_MODEL_ID}:predict`;
+
+/**
+* Generates an embedding vector using the Vertex AI API (Text Only for 'lost' status).
+ * Image embedding for 'found' status is complex and uses a placeholder warning.
+ * @param {string} inputSource - The text description to embed.
+ * @param {string} status - 'lost' or 'found'.
+ * @returns {number[] | null} A vector (array of numbers).
+ */
+const generateEmbedding = async (inputSource, status) => {
+    // --- FOUND ITEM LOGIC (Image) ---
+    if (status === 'found') {
+        // The multimodal image path requires more complex setup (GCS URI, not signed URL).
+        // Until that is built, we return a blank vector to prevent errors.
+        console.warn("🛑 WARNING: Image embedding (FOUND items) is pending complex Vertex AI implementation. Skipping vector generation.");
+        return [];
+    }
+
+    // --- LOST ITEM LOGIC (Text) ---
+    if (status === 'lost') {
+        try {
+            // 1. Get Authentication Token using the Service Account
+            const accessToken = await authClient.getAccessToken();
+
+            // 2. Structure the Vertex AI Payload for Text Embedding
+            const payload = {
+                instances: [{ content: inputSource }],
+            };
+
+            // 3. Make the Authenticated Request via Axios
+            const response = await axios.post(
+                VERTEX_ENDPOINT,
+                payload,
+                {
+                    headers: {
+                        Authorization: `Bearer ${accessToken}`,
+                        'Content-Type': 'application/json',
+                    },
+                }
+            );
+
+            // 4. Extract the Real Vector
+            const embedding = response.data.predictions[0].embeddings.values;
+            console.log(`✅ SUCCESS: Generated text vector of length ${embedding.length}.`);
+            return embedding;
+
+        } catch (error) {
+            if (axios.isAxiosError(error)) {
+                const status = error.response ? error.response.status : 'N/A';
+                console.error(`Vertex AI Text Embedding Failed (Status ${status}): ${JSON.stringify(error.response.data)}`);
+            } else {
+                 console.error('Error during AI embedding generation:', error.message);
+            }
+            console.error("ACTION REQUIRED: Ensure Vertex AI API is enabled and your Service Account has permissions.");
+            return null;
+        }
+    }
+    return null;
+};
+
+/**
+ * Calculates the Cosine Similarity between two vectors.
+ * Score is between 0 (no similarity) and 1 (identical).
+ * Formula: Cosine Similarity = (A . B) / (||A|| * ||B||)
+ * @param {number[]} vecA - Query vector
+ * @param {number[]} vecB - Target vector
+ * @returns {number} The similarity score (0 to 1).
+ */
+const cosineSimilarity = (vecA, vecB) => {
+    // Basic validation to ensure both are valid arrays of the same length
+    if (!vecA || !vecB || vecA.length === 0 || vecA.length !== vecB.length) {
+        return 0;
+    }
+
+    let dotProduct = 0;
+    let magnitudeA = 0;
+    let magnitudeB = 0;
+
+    for (let i = 0; i < vecA.length; i++) {
+        dotProduct += vecA[i] * vecB[i];
+        magnitudeA += vecA[i] * vecA[i];
+        magnitudeB += vecB[i] * vecB[i];
+    }
+
+    magnitudeA = Math.sqrt(magnitudeA);
+    magnitudeB = Math.sqrt(magnitudeB);
+
+    // Prevent division by zero
+    if (magnitudeA === 0 || magnitudeB === 0) {
+        return 0;
+    }
+
+    // Result is the dot product divided by the product of the magnitudes
+    return dotProduct / (magnitudeA * magnitudeB);
+};
 
 // --- CORE ITEM LOGIC ---
 
@@ -149,23 +270,44 @@ const createItemPost = async (req, res, frontendData, file) => {
     try {
         // 2. Upload image and get URL (if file exists)
         let imageUrl = null;
+        let signedUrl = null;
         if (file) {
-            imageUrl = await uploadFileToStorage(file);
-        } else if (frontendData.imageTempRef) {
-             // Fallback for mock data or if using a pre-uploaded ref
-            imageUrl = `temp/storage/${frontendData.imageTempRef}`; 
+            // UPLOAD NOW RETURNS THE SIGNED URL
+            signedUrl = await uploadFileToStorage(file);
+        }
+        imageUrl = signedUrl; // We will store the signed URL temporarily as the image URL for the DB
+
+        // *** IMPLEMENT MULTIMODAL STRATEGY ***
+        let imageVector = []; 
+        let embeddingSource = null;
+
+        if (frontendData.status === 'found' && signedUrl) {
+            // FOUND ITEM: Use the Signed URL (GCS path) as the source
+            embeddingSource = signedUrl; 
+            console.log("Generating image vector for Found item...");
+        } else if (frontendData.status === 'lost' && frontendData.description) {
+            // LOST ITEM: Use the text description for the vector
+            embeddingSource = frontendData.description;
+            console.log("Generating text vector for Lost item...");
+        }
+        
+        if (embeddingSource) {
+            imageVector = await generateEmbedding(embeddingSource, frontendData.status);
+            if (!imageVector || imageVector.length === 0) {
+                 console.warn(`Could not generate vector from ${frontendData.status}. Item posted without embedding.`);
+            }
         }
 
-        // 3. CONSTRUCTING THE FIRESTORE DOCUMENT (Server-Controlled Fields)
+        // 3. CONSTRUCTING THE FIRESTORE DOCUMENT
         const serverGeneratedFields = {
             posterUid: req.user.uid, 
-            isApproved: false, // Items require admin review by default
+            isApproved: false, 
             isResolved: false, 
             dateReported: admin.firestore.FieldValue.serverTimestamp(),
-            textEmbedding: [], // Placeholder for AI vector
-            imageUrl: imageUrl, // Use the real URL or placeholder
+            // *** UPDATED: Store the vector embedding ***
+            textEmbedding: imageVector, // Store the array of numbers
+            imageUrl: imageUrl, 
             
-            // Conditional field: only save if status is 'found' and data exists
             whereToCollect: frontendData.status === 'found' ? frontendData.whereToCollect || 'Pending location details' : null
         };
         
@@ -190,7 +332,7 @@ const createItemPost = async (req, res, frontendData, file) => {
         console.error('SERVER ERROR:', error.message || error);
         return res.status(500).json({ success: false, message: 'Internal Server Error during data processing.' });
     }
-};
+}
 
 
 // --- API ROUTES ---
@@ -223,7 +365,7 @@ app.get('/api/items', verifyTokenPlaceholder, async (req, res) => {
     try {
         let itemsRef = db.collection('items');
         
-        // 1. BASE QUERY: Filter for approved and unresolved items (Required for public view)
+        // 1. BASE QUERY: Filter for approved and unresolved items (Default public view)
         let query = itemsRef
             .where('isApproved', '==', true)
             .where('isResolved', '==', false);
@@ -337,6 +479,82 @@ app.post('/api/admin/set-role', verifyTokenPlaceholder, async (req, res) => {
     }
 });
 
+// 4. MATCHING ROUTE (GET /api/items/:itemId/matches)
+// Finds items that match the given itemId based on embedding similarity.
+app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) => {
+    const { itemId } = req.params;
+    const SIMILARITY_THRESHOLD = 0.5; // ADJUST: Confidence level (0.0 to 1.0)
+    const MAX_MATCHES = 5;
+
+    try {
+        // 1. Get the Query Item and its embedding (The item the user is looking at)
+        const queryDoc = await db.collection('items').doc(itemId).get();
+        if (!queryDoc.exists) {
+            return res.status(404).json({ success: false, message: 'Item not found.' });
+        }
+        const queryItem = queryDoc.data();
+        const queryVector = queryItem.textEmbedding;
+
+        // Ensure the query item has a valid vector
+        if (!queryVector || queryVector.length === 0) {
+            return res.status(200).json({ 
+                success: true, 
+                message: "No embedding found for this item. Cannot run matching.", 
+                matches: [] 
+            });
+        }
+        
+        // Determine the opposite status to match against (Lost matches Found, and vice-versa)
+        const targetStatus = queryItem.status === 'lost' ? 'found' : 'lost';
+
+        // 2. Fetch all eligible target items (opposite status, approved, unresolved)
+        // NOTE: This performs a full collection scan for eligible items.
+        const targetSnapshot = await db.collection('items')
+            .where('status', '==', targetStatus)
+            .where('isApproved', '==', true)
+            .where('isResolved', '==', false)
+            .get();
+        
+        // 3. Calculate Similarity for each target item
+        const matches = [];
+
+        targetSnapshot.docs.forEach(targetDoc => {
+            const targetItem = targetDoc.data();
+            const targetVector = targetItem.textEmbedding;
+
+            // Skip if target doesn't have a vector
+            if (!targetVector || targetVector.length === 0 || targetDoc.id === itemId) {
+                return; 
+            }
+            
+            // Calculate similarity score using the utility function
+            const score = cosineSimilarity(queryVector, targetVector);
+
+            if (score >= SIMILARITY_THRESHOLD) {
+                matches.push({
+                    id: targetDoc.id,
+                    score: parseFloat(score.toFixed(4)), // Keep 4 decimal places
+                    ...targetItem
+                });
+            }
+        });
+        
+        // 4. Sort by score (highest similarity first) and limit results
+        matches.sort((a, b) => b.score - a.score);
+        const topMatches = matches.slice(0, MAX_MATCHES);
+
+        res.status(200).json({ 
+            success: true,
+            queryId: itemId,
+            targetStatus: targetStatus,
+            matches: topMatches 
+        });
+
+    } catch (error) {
+        console.error('Matching Error:', error.message);
+        res.status(500).json({ success: false, message: 'Failed to find matches.' });
+    }
+});
 
 app.listen(PORT, () => {
     console.log(`Server is running on http://localhost:${PORT}`);
