@@ -96,8 +96,7 @@ const authClient = new GoogleAuth({
 // --- STORAGE UTILITY FUNCTION ---
 
 /**
- * Uploads a file buffer (from Multer) to Firebase Storage and returns a Signed URL.
- * The Signed URL grants time-limited read access to the AI model.
+ * Uploads a file buffer to GCS, makes it public, and returns the permanent public URL.
  * @param {object} file - The file object provided by Multer.
  * @returns {string} The Signed URL of the uploaded file.
  */
@@ -105,6 +104,7 @@ const uploadFileToStorage = async (file) => {
     if (!file) return null;
 
     const timestamp = Date.now();
+    // Re-use the existing file naming logic
     const fileName = `items/${timestamp}_${file.originalname.replace(/ /g, '_')}`;
     const fileUpload = bucket.file(fileName);
 
@@ -121,17 +121,13 @@ const uploadFileToStorage = async (file) => {
         });
 
         stream.on('finish', async () => {
-            // Generate a Signed URL valid for 30 minutes (1800 seconds)
-            const [signedUrl] = await fileUpload.getSignedUrl({
-                action: 'read',
-                expires: Date.now() + 1800 * 1000, // Expires in 30 minutes
-            });
+            // ACTION: Make the file public for permanent display
+            await fileUpload.makePublic(); 
             
-            // NEW: GCS URI format for AI services (gs://bucket-name/file/path)
-            const gcsUri = `gs://${bucketName}/${fileName}`; 
+            // Return the permanent public URL
+            const publicUrl = `https://storage.googleapis.com/${bucketName}/${fileName}`;
             
-            // Return BOTH the Signed URL (for DB/Front-end) and the GCS URI (for AI)
-            resolve({ signedUrl, gcsUri }); // <--- NOW RETURNS AN OBJECT
+            resolve(publicUrl); // Returns a simple URL string
         });
         
         stream.end(file.buffer); 
@@ -139,50 +135,25 @@ const uploadFileToStorage = async (file) => {
 };
 
 // --- AI UTILITY FUNCTION (GEMINI EMBEDDING) ---
-// NOTE: For pure text embedding, 'text-embedding-004' is often used, but we use a multimodal model to handle the image part.
-// Vertex AI Setup for Text Embedding (Requires Service Account Auth)
-const LOCATION = 'us-central1'; // Use a consistent region
-// Model for reliable text embedding
-const EMBEDDING_MODEL_ID = 'text-embedding-004'; 
+// Vertex AI Setup for Text Embedding (Simple and reliable)
+const LOCATION = 'asia-southeast1'; // Using stable region for the model
+const EMBEDDING_MODEL_ID = 'text-embedding-004'; // Reliable text-only model
 const VERTEX_ENDPOINT = `https://${LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${LOCATION}/publishers/google/models/${EMBEDDING_MODEL_ID}:predict`;
-
-const VERTEX_MULTIMODAL_MODEL_ID = 'multimodalembedding@001'; // Model for image/text fusion
-const VERTEX_MULTIMODAL_ENDPOINT = `https://${LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${LOCATION}/publishers/google/models/${VERTEX_MULTIMODAL_MODEL_ID}:predict`;
 /**
- * Generates a fused embedding vector using the Vertex AI API.
- * Uses Multimodal endpoint if image is present, Text-only endpoint otherwise.
- * @param {object} input - Object containing { text: string, imageUri?: string }
+ * Generates a text vector using the Vertex AI Text Embedding Model (text-embedding-004).
+ * @param {string} text - The text description to embed.
  * @returns {number[] | null} A vector (array of numbers).
  */
-const generateEmbedding = async (input) => {
+const generateEmbedding = async (text) => { 
     try {
         const accessToken = await authClient.getAccessToken();
 
-        // 1. Determine Endpoint and Payload Structure
-        let endpoint = VERTEX_ENDPOINT; // Default: Text-only (for lost items without photo)
-        let payload = {};
+        const payload = {
+            instances: [{ content: text }],
+        };
 
-        if (input.imageUri) {
-            // FUSION/IMAGE: Use the Multimodal endpoint and payload structure
-            endpoint = VERTEX_MULTIMODAL_ENDPOINT;
-            payload = {
-                instances: [{
-                    // Image input
-                    image: { gcsUri: input.imageUri }, 
-                    // Text input (fused with the image)
-                    text: input.text 
-                }]
-            };
-        } else {
-            // TEXT-ONLY: Use the Text Embedding endpoint
-            payload = {
-                instances: [{ content: input.text }],
-            };
-        }
-
-        // 2. Make the Authenticated Request via Axios
         const response = await axios.post(
-            endpoint,
+            VERTEX_ENDPOINT,
             payload,
             {
                 headers: {
@@ -192,61 +163,15 @@ const generateEmbedding = async (input) => {
             }
         );
 
-        // DEBUG: log the exact response shape when troubleshooting
-        console.debug("Vertex response data:", JSON.stringify(response.data, null, 2));
-
-        // --- ROBUST EMBEDDING EXTRACTION ---
-        // Walk the response to find the first array of numbers (embedding vector).
-        const findNumericArray = (root, maxDepth = 6) => {
-            const seen = new Set();
-            const queue = [{ node: root, depth: 0 }];
-            while (queue.length) {
-                const { node, depth } = queue.shift();
-                if (!node || depth > maxDepth) continue;
-                if (Array.isArray(node) && node.length > 0 && typeof node[0] === 'number') {
-                    return node;
-                }
-                if (Array.isArray(node)) {
-                    // push array elements for inspection
-                    for (const el of node) queue.push({ node: el, depth: depth + 1 });
-                } else if (typeof node === 'object') {
-                    for (const key of Object.keys(node)) {
-                        const child = node[key];
-                        if (child && typeof child === 'object' && !seen.has(child)) {
-                            seen.add(child);
-                            queue.push({ node: child, depth: depth + 1 });
-                        }
-                    }
-                }
-            }
-            return null;
-        };
-
-        // Try known prediction array first, then fallback to a generic search
-        const preds = response?.data?.predictions;
-        let vector = null;
-        if (Array.isArray(preds) && preds.length > 0) {
-            // try to find numeric array inside the first prediction object
-            vector = findNumericArray(preds[0]);
-        }
-        // fallback: search entire response body
-        if (!vector) vector = findNumericArray(response.data);
-
-        if (!vector) {
-            console.error("🛑 FAILURE: Could not find embedding vector in Vertex response. Full response:", JSON.stringify(response.data, null, 2));
-            return null;
-        }
-
-        return vector;
+        const embedding = response.data.predictions[0].embeddings.values;
+        console.log(`✅ SUCCESS: Generated text vector of length ${embedding.length} (768D expected).`);
+        return embedding;
 
     } catch (error) {
         if (axios.isAxiosError(error)) {
             const status = error.response ? error.response.status : 'N/A';
-            console.error(`Vertex AI Embedding Failed (Status ${status}): ${JSON.stringify(error.response.data)}`);
-        } else {
-             console.error('Error during AI embedding generation:', error.message);
+            console.error(`Vertex AI Text Embedding Failed (Status ${status}): ${JSON.stringify(error.response.data)}`);
         }
-        console.error("ACTION REQUIRED: Ensure both Text and Multimodal APIs are enabled in Vertex AI and permissions are correct.");
         return null;
     }
 };
@@ -290,56 +215,35 @@ const cosineSimilarity = (vecA, vecB) => {
 // --- CORE ITEM LOGIC ---
 
 /**
- * Handles the saving of item data to Firestore. Shared by POST /api/items and POST /api/test-item.
+ * Handles item creation, file upload, text embedding, and saving to Firestore.
  */
 const createItemPost = async (req, res, frontendData, file) => {
     
-    // 1. Basic Input Validation
-    if (!frontendData.name || !frontendData.status || !frontendData.category) {
+    if (!frontendData.name || !frontendData.status || !frontendData.category || !frontendData.lastSeenLocation || !frontendData.description) {
         return res.status(400).json({ 
             success: false, 
-            message: 'Missing required item fields: name, status, or category.' 
+            message: 'Missing required item fields: name, description, status, category or last seen location.' 
         });
     }
 
     try {
-        // 2. Upload image and get URL (if file exists)
         let finalImageUrl = null; // Stored in DB
-        let gcsUri = null;        // Used for AI
-
+        
+        // 2. Upload image and get URL (Image for display only)
         if (file) {
-            // UPLOAD NOW RETURNS THE OBJECT { signedUrl, gcsUri }
-            const imageUris = await uploadFileToStorage(file);
-            finalImageUrl = imageUris.signedUrl;
-            gcsUri = imageUris.gcsUri; 
+            finalImageUrl = await uploadFileToStorage(file);
         }
         
-        // *** IMPLEMENT MULTIMODAL FUSION STRATEGY ***
-        let imageVector = []; 
-        let embeddingInput = {}; // Object to hold { text, imageUri }
-
-        // 1. Always include text description (Compulsory)
+        // *** TEXT EMBEDDING GENERATION (Compulsory Text Input) ***
+        let textVector = []; 
         const itemText = frontendData.description || frontendData.name;
-        if (itemText) {
-            embeddingInput.text = itemText; 
-        } else {
-            // If the item name is also missing (shouldn't happen due to validation), skip vector creation
-            console.warn("Item lacks both description and name. Skipping vector generation.");
-        }
 
-        // 2. Add Image URI if available (Optional for Lost, Compulsory for Found)
-        if (gcsUri) { 
-            embeddingInput.imageUri = gcsUri; 
-        }
-        
-        // 3. Only proceed if we have at least text OR an image
-        if (Object.keys(embeddingInput).length > 0) {
-            console.log("Generating fused vector from multimodal input...");
+        if (itemText) {
+            console.log("Generating text vector...");
+            // Call the simplified text embedding function
+            textVector = await generateEmbedding(itemText); 
             
-            // Pass the source and status
-            imageVector = await generateEmbedding(embeddingInput); 
-            
-            if (!imageVector || imageVector.length === 0) {
+            if (!textVector || textVector.length === 0) {
                  console.warn("Could not generate vector. Item posted without embedding.");
             }
         }
@@ -350,23 +254,20 @@ const createItemPost = async (req, res, frontendData, file) => {
             isApproved: false, 
             isResolved: false, 
             dateReported: admin.firestore.FieldValue.serverTimestamp(),
-            textEmbedding: imageVector, // Store the array of numbers
-            imageUrl: finalImageUrl, // Use the signed URL for the front-end
-            
-            whereToCollect: frontendData.status === 'found' ? frontendData.whereToCollect || 'Pending location details' : null
+            textEmbedding: textVector, // Store the text vector
+            imageUrl: finalImageUrl, 
+            lastSeenLocation: frontendData.lastSeenLocation,
+            itemCollectLocation: frontendData.status === 'found' ? frontendData.itemCollectLocation || 'Pending location details' : null
         };
         
-        // Combine frontend data with server-controlled fields
         const itemDocument = {
             ...frontendData, 
             ...serverGeneratedFields
         };
         delete itemDocument.imageTempRef; 
         
-        // 4. Save the new document to the 'items' collection
         const docRef = await db.collection('items').add(itemDocument);
 
-        // Success Response (201 Created)
         return res.status(201).json({
             success: true,
             message: `${frontendData.status} item successfully posted for approval.`,
@@ -521,7 +422,7 @@ app.post('/api/admin/set-role', verifyTokenPlaceholder, async (req, res) => {
 // 4. MATCHING ROUTE (GET /api/items/:itemId/matches)
 app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) => {
     const { itemId } = req.params;
-    const SIMILARITY_THRESHOLD = 0.0001; // ADJUST: Confidence level (0.0 to 1.0)
+    const SIMILARITY_THRESHOLD = 0.8; // ADJUST: Confidence level (0.0 to 1.0)
     const MAX_MATCHES = 5;
 
     try {
@@ -567,9 +468,8 @@ app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) =
             // Calculate similarity score using the utility function
             const score = cosineSimilarity(queryVector, targetVector);
 
-            // --- NEW DEBUG LOG ---
+            //TO EMIT DURING FINAL PRODUCTION****************
             console.log(`DEBUG SCORE: Item ID ${targetDoc.id} vs Query ID ${itemId} Score: ${score}`);
-            // --- END DEBUG LOG ---
 
             if (score >= SIMILARITY_THRESHOLD) {
                 matches.push({
@@ -579,8 +479,6 @@ app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) =
                 });
             }
         });
-        
-        // 🛑 FIX: SORT AND RETURN THE RESULTS HERE
         
         // 4. Sort by score (highest similarity first) and limit results
         matches.sort((a, b) => b.score - a.score);

@@ -5,11 +5,11 @@ Content-Type: multipart/form-data; boundary=Rest_Client_Boundary
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="name"
 
-Laptop Bag
+Matric Card
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="description"
 
-Black Hp laptop bag with green stripes, got few keychains, chiikawa + pink pig, and french fries keychains
+Matric Card with number A23KE0522, Malay Male
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="category"
 
@@ -17,10 +17,14 @@ Personal Items
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="status"
 
-found
+lost
+--Rest_Client_Boundary
+Content-Disposition: form-data; name="lastSeenLocation"
+
+P16 FKE
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="itemImage"; filename="test_image.jpg"
 Content-Type: image/jpeg
 
-< C:\Users\User\Downloads\20251129_033148.jpg
+< C:\Users\User\Downloads\test_image.jpg
 --Rest_Client_Boundary--
