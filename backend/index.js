@@ -6,9 +6,8 @@ import path from 'path'; // Node.js native module for path resolution
 import { fileURLToPath } from 'url'; // For path resolution in ES Modules
 import { Storage } from '@google-cloud/storage'; // Google Cloud Storage SDK
 import multer from 'multer'; // Middleware for handling file uploads
-import { GoogleGenAI } from "@google/genai"; // Gemini SDK
-import { GoogleAuth } from 'google-auth-library'; // NEW IMPORT
-import axios from 'axios';
+import { GoogleAuth } from 'google-auth-library'; // Google Auth Library
+import axios from 'axios'; //HTTP Client
 
 // Load environment variables immediately
 dotenv.config();
@@ -122,17 +121,17 @@ const uploadFileToStorage = async (file) => {
         });
 
         stream.on('finish', async () => {
-            // 🛑 IMPORTANT: Do NOT make public. Use Signed URL instead.
-            // await fileUpload.makePublic(); // Comment out or remove this line!
-
             // Generate a Signed URL valid for 30 minutes (1800 seconds)
             const [signedUrl] = await fileUpload.getSignedUrl({
                 action: 'read',
                 expires: Date.now() + 1800 * 1000, // Expires in 30 minutes
             });
             
-            // Return the Signed URL
-            resolve(signedUrl);
+            // NEW: GCS URI format for AI services (gs://bucket-name/file/path)
+            const gcsUri = `gs://${bucketName}/${fileName}`; 
+            
+            // Return BOTH the Signed URL (for DB/Front-end) and the GCS URI (for AI)
+            resolve({ signedUrl, gcsUri }); // <--- NOW RETURNS AN OBJECT
         });
         
         stream.end(file.buffer); 
@@ -140,80 +139,116 @@ const uploadFileToStorage = async (file) => {
 };
 
 // --- AI UTILITY FUNCTION (GEMINI EMBEDDING) ---
-// Ensure you have GEMINI_API_KEY in your .env file
-const GEMINI_API_KEY = process.env.GEMINI_API_KEY; 
-
-if (!GEMINI_API_KEY) {
-    console.error("❌ FATAL: GEMINI_API_KEY is missing in .env file.");
-    process.exit(1);
-}
-
-// Initialize the Gemini Client
-const ai = new GoogleGenAI({ apiKey: GEMINI_API_KEY });
-const EMBEDDING_MODEL = 'models/gemini-2.5-flash'; // Flash supports multimodal content
 // NOTE: For pure text embedding, 'text-embedding-004' is often used, but we use a multimodal model to handle the image part.
 // Vertex AI Setup for Text Embedding (Requires Service Account Auth)
-const LOCATION = 'asia-southeast1'; // Use a consistent region
+const LOCATION = 'us-central1'; // Use a consistent region
 // Model for reliable text embedding
 const EMBEDDING_MODEL_ID = 'text-embedding-004'; 
 const VERTEX_ENDPOINT = `https://${LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${LOCATION}/publishers/google/models/${EMBEDDING_MODEL_ID}:predict`;
 
+const VERTEX_MULTIMODAL_MODEL_ID = 'multimodalembedding@001'; // Model for image/text fusion
+const VERTEX_MULTIMODAL_ENDPOINT = `https://${LOCATION}-aiplatform.googleapis.com/v1/projects/${projectId}/locations/${LOCATION}/publishers/google/models/${VERTEX_MULTIMODAL_MODEL_ID}:predict`;
 /**
-* Generates an embedding vector using the Vertex AI API (Text Only for 'lost' status).
- * Image embedding for 'found' status is complex and uses a placeholder warning.
- * @param {string} inputSource - The text description to embed.
- * @param {string} status - 'lost' or 'found'.
+ * Generates a fused embedding vector using the Vertex AI API.
+ * Uses Multimodal endpoint if image is present, Text-only endpoint otherwise.
+ * @param {object} input - Object containing { text: string, imageUri?: string }
  * @returns {number[] | null} A vector (array of numbers).
  */
-const generateEmbedding = async (inputSource, status) => {
-    // --- FOUND ITEM LOGIC (Image) ---
-    if (status === 'found') {
-        // The multimodal image path requires more complex setup (GCS URI, not signed URL).
-        // Until that is built, we return a blank vector to prevent errors.
-        console.warn("🛑 WARNING: Image embedding (FOUND items) is pending complex Vertex AI implementation. Skipping vector generation.");
-        return [];
-    }
+const generateEmbedding = async (input) => {
+    try {
+        const accessToken = await authClient.getAccessToken();
 
-    // --- LOST ITEM LOGIC (Text) ---
-    if (status === 'lost') {
-        try {
-            // 1. Get Authentication Token using the Service Account
-            const accessToken = await authClient.getAccessToken();
+        // 1. Determine Endpoint and Payload Structure
+        let endpoint = VERTEX_ENDPOINT; // Default: Text-only (for lost items without photo)
+        let payload = {};
 
-            // 2. Structure the Vertex AI Payload for Text Embedding
-            const payload = {
-                instances: [{ content: inputSource }],
+        if (input.imageUri) {
+            // FUSION/IMAGE: Use the Multimodal endpoint and payload structure
+            endpoint = VERTEX_MULTIMODAL_ENDPOINT;
+            payload = {
+                instances: [{
+                    // Image input
+                    image: { gcsUri: input.imageUri }, 
+                    // Text input (fused with the image)
+                    text: input.text 
+                }]
             };
+        } else {
+            // TEXT-ONLY: Use the Text Embedding endpoint
+            payload = {
+                instances: [{ content: input.text }],
+            };
+        }
 
-            // 3. Make the Authenticated Request via Axios
-            const response = await axios.post(
-                VERTEX_ENDPOINT,
-                payload,
-                {
-                    headers: {
-                        Authorization: `Bearer ${accessToken}`,
-                        'Content-Type': 'application/json',
-                    },
-                }
-            );
-
-            // 4. Extract the Real Vector
-            const embedding = response.data.predictions[0].embeddings.values;
-            console.log(`✅ SUCCESS: Generated text vector of length ${embedding.length}.`);
-            return embedding;
-
-        } catch (error) {
-            if (axios.isAxiosError(error)) {
-                const status = error.response ? error.response.status : 'N/A';
-                console.error(`Vertex AI Text Embedding Failed (Status ${status}): ${JSON.stringify(error.response.data)}`);
-            } else {
-                 console.error('Error during AI embedding generation:', error.message);
+        // 2. Make the Authenticated Request via Axios
+        const response = await axios.post(
+            endpoint,
+            payload,
+            {
+                headers: {
+                    Authorization: `Bearer ${accessToken}`,
+                    'Content-Type': 'application/json',
+                },
             }
-            console.error("ACTION REQUIRED: Ensure Vertex AI API is enabled and your Service Account has permissions.");
+        );
+
+        // DEBUG: log the exact response shape when troubleshooting
+        console.debug("Vertex response data:", JSON.stringify(response.data, null, 2));
+
+        // --- ROBUST EMBEDDING EXTRACTION ---
+        // Walk the response to find the first array of numbers (embedding vector).
+        const findNumericArray = (root, maxDepth = 6) => {
+            const seen = new Set();
+            const queue = [{ node: root, depth: 0 }];
+            while (queue.length) {
+                const { node, depth } = queue.shift();
+                if (!node || depth > maxDepth) continue;
+                if (Array.isArray(node) && node.length > 0 && typeof node[0] === 'number') {
+                    return node;
+                }
+                if (Array.isArray(node)) {
+                    // push array elements for inspection
+                    for (const el of node) queue.push({ node: el, depth: depth + 1 });
+                } else if (typeof node === 'object') {
+                    for (const key of Object.keys(node)) {
+                        const child = node[key];
+                        if (child && typeof child === 'object' && !seen.has(child)) {
+                            seen.add(child);
+                            queue.push({ node: child, depth: depth + 1 });
+                        }
+                    }
+                }
+            }
+            return null;
+        };
+
+        // Try known prediction array first, then fallback to a generic search
+        const preds = response?.data?.predictions;
+        let vector = null;
+        if (Array.isArray(preds) && preds.length > 0) {
+            // try to find numeric array inside the first prediction object
+            vector = findNumericArray(preds[0]);
+        }
+        // fallback: search entire response body
+        if (!vector) vector = findNumericArray(response.data);
+
+        if (!vector) {
+            console.error("🛑 FAILURE: Could not find embedding vector in Vertex response. Full response:", JSON.stringify(response.data, null, 2));
             return null;
         }
+
+        return vector;
+
+    } catch (error) {
+        if (axios.isAxiosError(error)) {
+            const status = error.response ? error.response.status : 'N/A';
+            console.error(`Vertex AI Embedding Failed (Status ${status}): ${JSON.stringify(error.response.data)}`);
+        } else {
+             console.error('Error during AI embedding generation:', error.message);
+        }
+        console.error("ACTION REQUIRED: Ensure both Text and Multimodal APIs are enabled in Vertex AI and permissions are correct.");
+        return null;
     }
-    return null;
 };
 
 /**
@@ -269,32 +304,43 @@ const createItemPost = async (req, res, frontendData, file) => {
 
     try {
         // 2. Upload image and get URL (if file exists)
-        let imageUrl = null;
-        let signedUrl = null;
+        let finalImageUrl = null; // Stored in DB
+        let gcsUri = null;        // Used for AI
+
         if (file) {
-            // UPLOAD NOW RETURNS THE SIGNED URL
-            signedUrl = await uploadFileToStorage(file);
-        }
-        imageUrl = signedUrl; // We will store the signed URL temporarily as the image URL for the DB
-
-        // *** IMPLEMENT MULTIMODAL STRATEGY ***
-        let imageVector = []; 
-        let embeddingSource = null;
-
-        if (frontendData.status === 'found' && signedUrl) {
-            // FOUND ITEM: Use the Signed URL (GCS path) as the source
-            embeddingSource = signedUrl; 
-            console.log("Generating image vector for Found item...");
-        } else if (frontendData.status === 'lost' && frontendData.description) {
-            // LOST ITEM: Use the text description for the vector
-            embeddingSource = frontendData.description;
-            console.log("Generating text vector for Lost item...");
+            // UPLOAD NOW RETURNS THE OBJECT { signedUrl, gcsUri }
+            const imageUris = await uploadFileToStorage(file);
+            finalImageUrl = imageUris.signedUrl;
+            gcsUri = imageUris.gcsUri; 
         }
         
-        if (embeddingSource) {
-            imageVector = await generateEmbedding(embeddingSource, frontendData.status);
+        // *** IMPLEMENT MULTIMODAL FUSION STRATEGY ***
+        let imageVector = []; 
+        let embeddingInput = {}; // Object to hold { text, imageUri }
+
+        // 1. Always include text description (Compulsory)
+        const itemText = frontendData.description || frontendData.name;
+        if (itemText) {
+            embeddingInput.text = itemText; 
+        } else {
+            // If the item name is also missing (shouldn't happen due to validation), skip vector creation
+            console.warn("Item lacks both description and name. Skipping vector generation.");
+        }
+
+        // 2. Add Image URI if available (Optional for Lost, Compulsory for Found)
+        if (gcsUri) { 
+            embeddingInput.imageUri = gcsUri; 
+        }
+        
+        // 3. Only proceed if we have at least text OR an image
+        if (Object.keys(embeddingInput).length > 0) {
+            console.log("Generating fused vector from multimodal input...");
+            
+            // Pass the source and status
+            imageVector = await generateEmbedding(embeddingInput); 
+            
             if (!imageVector || imageVector.length === 0) {
-                 console.warn(`Could not generate vector from ${frontendData.status}. Item posted without embedding.`);
+                 console.warn("Could not generate vector. Item posted without embedding.");
             }
         }
 
@@ -304,9 +350,8 @@ const createItemPost = async (req, res, frontendData, file) => {
             isApproved: false, 
             isResolved: false, 
             dateReported: admin.firestore.FieldValue.serverTimestamp(),
-            // *** UPDATED: Store the vector embedding ***
             textEmbedding: imageVector, // Store the array of numbers
-            imageUrl: imageUrl, 
+            imageUrl: finalImageUrl, // Use the signed URL for the front-end
             
             whereToCollect: frontendData.status === 'found' ? frontendData.whereToCollect || 'Pending location details' : null
         };
@@ -334,17 +379,11 @@ const createItemPost = async (req, res, frontendData, file) => {
     }
 }
 
-
 // --- API ROUTES ---
 
 // Health Check / Default Route
 app.get("/", (req, res) => {
     res.send("Hello from the Lost & Found Backend!");
-});
-
-// Mock User Data Route (Temporary for frontend proxy test)
-app.get("/api/user", (req, res) => {
-    res.json(users);
 });
 
 
@@ -480,10 +519,9 @@ app.post('/api/admin/set-role', verifyTokenPlaceholder, async (req, res) => {
 });
 
 // 4. MATCHING ROUTE (GET /api/items/:itemId/matches)
-// Finds items that match the given itemId based on embedding similarity.
 app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) => {
     const { itemId } = req.params;
-    const SIMILARITY_THRESHOLD = 0.5; // ADJUST: Confidence level (0.0 to 1.0)
+    const SIMILARITY_THRESHOLD = 0.0001; // ADJUST: Confidence level (0.0 to 1.0)
     const MAX_MATCHES = 5;
 
     try {
@@ -508,7 +546,6 @@ app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) =
         const targetStatus = queryItem.status === 'lost' ? 'found' : 'lost';
 
         // 2. Fetch all eligible target items (opposite status, approved, unresolved)
-        // NOTE: This performs a full collection scan for eligible items.
         const targetSnapshot = await db.collection('items')
             .where('status', '==', targetStatus)
             .where('isApproved', '==', true)
@@ -530,6 +567,10 @@ app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) =
             // Calculate similarity score using the utility function
             const score = cosineSimilarity(queryVector, targetVector);
 
+            // --- NEW DEBUG LOG ---
+            console.log(`DEBUG SCORE: Item ID ${targetDoc.id} vs Query ID ${itemId} Score: ${score}`);
+            // --- END DEBUG LOG ---
+
             if (score >= SIMILARITY_THRESHOLD) {
                 matches.push({
                     id: targetDoc.id,
@@ -539,10 +580,13 @@ app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) =
             }
         });
         
+        // 🛑 FIX: SORT AND RETURN THE RESULTS HERE
+        
         // 4. Sort by score (highest similarity first) and limit results
         matches.sort((a, b) => b.score - a.score);
         const topMatches = matches.slice(0, MAX_MATCHES);
 
+        // 5. Send the final JSON response
         res.status(200).json({ 
             success: true,
             queryId: itemId,
