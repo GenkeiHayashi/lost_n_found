@@ -82,10 +82,29 @@ app.use(cors());         // Essential for frontend communication
 
 // --- AUTHENTICATION PLACEHOLDER MIDDLEWARE ---
 
-const verifyTokenPlaceholder = (req, res, next) => {
-    // Replace 'PASTE_YOUR_SAVED_UID_HERE' with the UID you got from Step 1.
-    req.user = { uid: 'zoWc2u0MWphZdmf38nSfWTkqa8v1' }; 
-    next();
+const verifyToken = async (req, res, next) => {
+    // 1. Get the token from the Authorization header (e.g., 'Bearer <token>')
+    const header = req.headers.authorization;
+    if (!header || !header.startsWith('Bearer ')) {
+        return res.status(403).json({ message: 'Authorization required.' });
+    }
+
+    const idToken = header.split('Bearer ')[1];
+
+    try {
+        // 2. Verify the token using Firebase Admin SDK
+        // This confirms the token is valid, hasn't expired, and was issued by Firebase.
+        const decodedToken = await auth.verifyIdToken(idToken);
+        
+        // 3. Attach the user object (UID and Custom Claims like 'role') to the request
+        req.user = decodedToken; 
+        
+        next(); // Proceed to the route handler
+
+    } catch (error) {
+        console.error("Token Verification Error:", error.message);
+        return res.status(401).json({ message: 'Invalid or expired authentication token.' });
+    }
 };
 
 const authClient = new GoogleAuth({ 
@@ -290,14 +309,14 @@ app.get("/", (req, res) => {
 
 // 1. CREATE ITEM POST ROUTE (POST /api/items)
 // 'upload.single('itemImage')' is the Multer middleware that handles the file named 'itemImage'
-app.post('/api/items', verifyTokenPlaceholder, upload.single('itemImage'), async (req, res) => {
+app.post('/api/items', verifyToken, upload.single('itemImage'), async (req, res) => {
     // req.body contains the JSON data, req.file contains the image file
     await createItemPost(req, res, req.body, req.file);
 });
 
 
 // 2. READ & FILTER ITEMS ROUTE (GET /api/items)
-app.get('/api/items', verifyTokenPlaceholder, async (req, res) => {
+app.get('/api/items', verifyToken, async (req, res) => {
     
     // Extract query parameters from req.query
     const { category, status, lastSeenLocation, sortBy, sortOrder } = req.query; 
@@ -392,7 +411,7 @@ app.post('/api/auth/register', async (req, res) => {
 
 
 // Route 3b: Set Admin Role (Admin Utility - needs protection later)
-app.post('/api/admin/set-role', verifyTokenPlaceholder, async (req, res) => {
+app.post('/api/admin/set-role', verifyToken, async (req, res) => {
     const { targetUid, role } = req.body; // targetUid: UID to promote, role: 'admin' or 'user'
 
     if (!targetUid) {
@@ -419,8 +438,69 @@ app.post('/api/admin/set-role', verifyTokenPlaceholder, async (req, res) => {
     }
 });
 
+// Route 3c: Login User (Issues a session token with role claims)
+app.get('/api/auth/login', async (req, res) => {
+    const { email, password } = req.body;
+    
+    if (!email || !password) {
+        return res.status(400).json({ message: "Email and password are required." });
+    }
+
+    try {
+        // 🛑 STEP 1: Authenticate user using Firebase Client SDK equivalent
+        // Since Firebase Admin SDK cannot sign in users, we use a utility API.
+        // NOTE: This uses the Identity Toolkit REST API, which requires the project's Web API Key.
+        const WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY; 
+        const SIGN_IN_ENDPOINT = `https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key=${WEB_API_KEY}`;
+        
+        // Make the external API call to verify the user's password
+        const signInResponse = await axios.post(SIGN_IN_ENDPOINT, {
+            email: email,
+            password: password,
+            returnSecureToken: true
+        });
+
+        const idToken = signInResponse.data.idToken;
+        const localId = signInResponse.data.localId;
+        
+        // 🛑 STEP 2: Get the user's role from Firestore
+        const userDoc = await db.collection('users').doc(localId).get();
+        if (!userDoc.exists) {
+            return res.status(404).json({ message: "User profile not found in database." });
+        }
+        const userData = userDoc.data();
+        const role = userData.isAdmin ? 'admin' : 'user';
+
+        // 🛑 STEP 3: Optionally update Firebase Custom Claims (for future security checks)
+        await auth.setCustomUserClaims(localId, { role: role });
+
+        // 🛑 STEP 4: Respond with the necessary data for the frontend
+        res.status(200).json({ 
+            success: true, 
+            message: "Login successful.", 
+            token: idToken, // The Firebase ID Token (JWT)
+            user: {
+                uid: localId,
+                email: email,
+                displayName: userData.displayName,
+                role: role // Crucial for frontend routing
+            }
+        });
+
+    } catch (error) {
+        let message = "Login failed. Invalid email or password.";
+        if (axios.isAxiosError(error) && error.response?.data?.error?.message) {
+             // Extract specific errors from the Identity Toolkit API
+             message = error.response.data.error.message.replace(/EMAIL_NOT_FOUND|INVALID_PASSWORD/g, 'Invalid email or password.');
+        } else {
+             console.error("Login Error:", error.message);
+        }
+        res.status(401).json({ message: message });
+    }
+});
+
 // 4. MATCHING ROUTE (GET /api/items/:itemId/matches)
-app.get('/api/items/:itemId/matches', verifyTokenPlaceholder, async (req, res) => {
+app.get('/api/items/:itemId/matches', verifyToken, async (req, res) => {
     const { itemId } = req.params;
     const SIMILARITY_THRESHOLD = 0.8; // ADJUST: Confidence level (0.0 to 1.0)
     const MAX_MATCHES = 5;
