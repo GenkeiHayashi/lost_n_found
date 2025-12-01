@@ -5,5 +5,5 @@ Authorization: Bearer eyJhbGciOiJSUzI1NiIsImtpZCI6IjdjNzQ5NTFmNjBhMDE0NzE3ZjFlMz
 
 {
     "targetUid": "hcdRzhZzWIQP4t4pByWMjINZcQ22",
-    "role": "user"  // Use "user" to demote
+    "role": "user"  // Use "user" to demote; "admin" to promote
 }

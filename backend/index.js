@@ -80,7 +80,7 @@ app.use(express.json()); // Essential for handling JSON data
 app.use(cors());         // Essential for frontend communication
 
 
-// --- AUTHENTICATION PLACEHOLDER MIDDLEWARE ---
+// --- AUTHENTICATION ---
 
 const verifyToken = async (req, res, next) => {
     // 1. Get the token from the Authorization header (e.g., 'Bearer <token>')
@@ -123,7 +123,6 @@ const uploadFileToStorage = async (file) => {
     if (!file) return null;
 
     const timestamp = Date.now();
-    // Re-use the existing file naming logic
     const fileName = `items/${timestamp}_${file.originalname.replace(/ /g, '_')}`;
     const fileUpload = bucket.file(fileName);
 
@@ -140,7 +139,7 @@ const uploadFileToStorage = async (file) => {
         });
 
         stream.on('finish', async () => {
-            // ACTION: Make the file public for permanent display
+            // Make the file public for permanent display
             await fileUpload.makePublic(); 
             
             // Return the permanent public URL
@@ -329,7 +328,7 @@ app.get('/api/items', verifyToken, async (req, res) => {
             .where('isApproved', '==', true)
             .where('isResolved', '==', false);
 
-        // 2. DYNAMIC FILTERING (Exact Match)
+        // 2. DYNAMIC FILTERING (Exact Match) *Remove based on final implementation*
         if (category) {
             // Filter by item type/category
             query = query.where('category', '==', category);
@@ -447,7 +446,7 @@ app.get('/api/auth/login', async (req, res) => {
     }
 
     try {
-        // 🛑 STEP 1: Authenticate user using Firebase Client SDK equivalent
+        // 1: Authenticate user using Firebase Client SDK equivalent
         // Since Firebase Admin SDK cannot sign in users, we use a utility API.
         // NOTE: This uses the Identity Toolkit REST API, which requires the project's Web API Key.
         const WEB_API_KEY = process.env.FIREBASE_WEB_API_KEY; 
@@ -463,7 +462,7 @@ app.get('/api/auth/login', async (req, res) => {
         const idToken = signInResponse.data.idToken;
         const localId = signInResponse.data.localId;
         
-        // 🛑 STEP 2: Get the user's role from Firestore
+        // 2: Get the user's role from Firestore
         const userDoc = await db.collection('users').doc(localId).get();
         if (!userDoc.exists) {
             return res.status(404).json({ message: "User profile not found in database." });
@@ -471,10 +470,10 @@ app.get('/api/auth/login', async (req, res) => {
         const userData = userDoc.data();
         const role = userData.isAdmin ? 'admin' : 'user';
 
-        // 🛑 STEP 3: Optionally update Firebase Custom Claims (for future security checks)
+        // 3: Optionally update Firebase Custom Claims (for future security checks)
         await auth.setCustomUserClaims(localId, { role: role });
 
-        // 🛑 STEP 4: Respond with the necessary data for the frontend
+        // 4: Respond with the necessary data for the frontend
         res.status(200).json({ 
             success: true, 
             message: "Login successful.", 
