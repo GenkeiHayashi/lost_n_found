@@ -9,7 +9,7 @@ Matric Card
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="description"
 
-Matric Card with number A23KE0522, Malay Male
+Found a blue colour matric card, malaysian man got matric number a23ke0522.
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="category"
 
@@ -17,7 +17,7 @@ Personal Items
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="status"
 
-lost
+found
 --Rest_Client_Boundary
 Content-Disposition: form-data; name="lastSeenLocation"
 

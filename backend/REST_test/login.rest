@@ -1,0 +1,9 @@
+//Login to your registered Account
+
+GET http://localhost:3000/api/auth/login
+Content-Type: application/json
+
+{
+    "email": "adminpromax@utm.com",
+    "password": "SecurePassword123!"
+}

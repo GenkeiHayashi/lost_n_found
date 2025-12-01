@@ -1,0 +1,9 @@
+//Register a new Account
+POST http://localhost:3000/api/auth/register
+Content-Type: application/json
+
+{
+    "email": "adminpromax@utm.com",
+    "password": "SecurePassword123!",
+    "displayName": "Admin Promax"
+}
